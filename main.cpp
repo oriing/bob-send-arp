@@ -149,7 +149,7 @@ void getMacFromArp(Ip tip, Ip usingip){
 
         EthArpPacket* packetPtr = (EthArpPacket*)data;
 
-        if(packetPtr->eth_.type_ != htons(EthHdr::Arp))    continue;
+        if(packetPtr->eth_.type_ != htons(EthHdr::Arp)) continue;
         if(packetPtr->arp_.sip_  != htonl(tip))         continue;
 
         macs.push_back(packetPtr->arp_.smac());
